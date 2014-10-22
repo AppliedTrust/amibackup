@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-const version = "0.6"
+const version = "0.7"
 
 var usage = `amibackup: create cross-region AWS AMI backups
 
@@ -25,7 +25,7 @@ Usage:
 Options:
   -s, --source=<region>     AWS region of running instance [default: us-east-1].
   -d, --dest=<region>       AWS region to store backup AMI [default: us-west-1].
-  -t, --timeout=<secs>      Timeout waiting for AMI creation [default: 300].
+  -t, --timeout=<secs>      Timeout waiting for AMI creation [default: 1800].
   -p, --purge=<window>      Comma-separated list of purge windows - see below for details.
   -n, --nagios              Run like a Nagios check.
   -o, --purgeonly           Purge old AMIs without creating new ones.
@@ -85,16 +85,16 @@ var regionMap = map[string]aws.Region{
 	"ap-northeast-1": aws.APNortheast,
 	"sa-east-1":      aws.SAEast,
 }
+
+// time formatting
 var timeSecs = fmt.Sprintf("%d", time.Now().Unix())
 var timeStamp = time.Now().Format("2006-01-02_15-04-05")
 var timeShortFormat = "01/02/2006@15:04:05"
 var timeString = time.Now().Format("2006-01-02 15:04:05 -0700")
 
-//////// our main function
 func main() {
 	s := &session{}
 
-	// parse cli options
 	handleOptions(s)
 
 	// connect to AWS
@@ -116,7 +116,7 @@ func main() {
 		}
 	}
 	if s.purgeonly {
-		s.ok("Pruning done and --purgeonly specified - exiting.")
+		s.ok("Purging done and --purgeonly specified - exiting.")
 		os.Exit(s.finish())
 	}
 
@@ -138,15 +138,10 @@ func main() {
 	os.Exit(s.finish())
 }
 
-//////// ALL DONE!
-
-////////
-// search for our instances
+// findInstances searches for our instances
 func findInstances(awsec2 *ec2.EC2, s *session) []ec2.Instance {
-
 	filter := ec2.NewFilter()
 	filter.Add("tag:Name", s.instanceNameTag)
-
 	resp, err := awsec2.DescribeInstances(nil, filter)
 	if err != nil {
 		s.fatal(fmt.Sprintf("EC2 API DescribeInstances failed: %s", err.Error()))
@@ -160,8 +155,24 @@ func findInstances(awsec2 *ec2.EC2, s *session) []ec2.Instance {
 	return instances
 }
 
-////////
-// create the ami(s)
+// findSnapshots returns a map of snapshots associated with an AMI
+func findSnapshots(amiid string, awsec2 *ec2.EC2) (map[string]string, error) {
+	snaps := make(map[string]string)
+	resp, err := awsec2.Images([]string{amiid}, nil)
+	if err != nil {
+		return snaps, fmt.Errorf("EC2 API DescribeImages failed: %s", err.Error())
+	}
+	for _, image := range resp.Images {
+		for _, bd := range image.BlockDevices {
+			if len(bd.SnapshotId) > 0 {
+				snaps[bd.SnapshotId] = bd.DeviceName
+			}
+		}
+	}
+	return snaps, nil
+}
+
+// createAMIs actually creates the AMI(s)
 func createAMIs(awsec2 *ec2.EC2, instances []ec2.Instance, s *session) map[string]string {
 	newAMIs := make(map[string]string)
 	pendingAMIs := make(map[string]bool)
@@ -221,8 +232,7 @@ func createAMIs(awsec2 *ec2.EC2, instances []ec2.Instance, s *session) map[strin
 	return newAMIs
 }
 
-////////
-// start the ami copy
+// copyAMI starts the AMI copy
 func copyAMI(awsec2dest *ec2.EC2, s *session, amis *map[string]string) {
 	if s.destRegion.Name != s.sourceRegion.Name {
 		for amiId, instanceId := range *amis {
@@ -249,8 +259,7 @@ func copyAMI(awsec2dest *ec2.EC2, s *session, amis *map[string]string) {
 	}
 }
 
-////////
-// purge AMIs based on specified windows
+// purgeAMIs purges AMIs based on specified windows
 func purgeAMIs(awsec2 *ec2.EC2, instanceNameTag string, windows []window, s *session) error {
 	filter := ec2.NewFilter()
 	filter.Add("tag:hostname", instanceNameTag)
@@ -283,20 +292,44 @@ func purgeAMIs(awsec2 *ec2.EC2, instanceNameTag string, windows []window, s *ses
 		for cursor := window.start; cursor.Before(window.stop); cursor = cursor.Add(window.interval) {
 			imagesInThisInterval := []string{}
 			imagesTimes := make(map[string]time.Time)
+			oldestImage := ""
+			oldestImageTime := time.Now()
 			for id, when := range images {
 				if when.After(cursor) && when.Before(cursor.Add(window.interval)) {
 					imagesInThisInterval = append(imagesInThisInterval, id)
 					imagesTimes[id] = when
+					if when.Before(oldestImageTime) {
+						oldestImageTime = when
+						oldestImage = id
+					}
 				}
 			}
 			if len(imagesInThisInterval) > 1 {
-				for _, id := range imagesInThisInterval[1:] { //keep the oldest one
+				for _, id := range imagesInThisInterval {
+					if id == oldestImage { // keep the oldest one
+						s.debug(fmt.Sprintf("Keeping oldest AMI in this window: %s @ %s (%s->%s)", id, imagesTimes[id].Format(timeShortFormat), window.start.Format(timeShortFormat), window.stop.Format(timeShortFormat)))
+						continue
+					}
+					// find snapshots associated with this AMI.
+					snaps, err := findSnapshots(id, awsec2)
+					if err != nil {
+						return fmt.Errorf("EC2 API findSnapshots failed for %s: %s", id, err.Error())
+					}
+					// deregister the AMI.
 					resp, err := awsec2.DeregisterImage(id)
 					if err != nil {
 						return fmt.Errorf("EC2 API DeregisterImage failed for %s: %s", id, err.Error())
 					}
 					if resp.Response != true {
 						return fmt.Errorf("EC2 API DeregisterImage error for %s", id)
+					}
+					// delete snapshots associated with this AMI.
+					for snap, _ := range snaps {
+						_, err := awsec2.DeleteSnapshots(snap)
+						if err != nil {
+							return fmt.Errorf("EC2 API DeleteSnapshots failed for %s: %s", snap, err.Error())
+						}
+						s.debug(fmt.Sprintf("Deleted snapshot: %s (%s)", snap, id))
 					}
 					s.debug(fmt.Sprintf("Purged old AMI %s @ %s (%s->%s)", id, imagesTimes[id].Format(timeShortFormat), window.start.Format(timeShortFormat), window.stop.Format(timeShortFormat)))
 				}
@@ -306,8 +339,7 @@ func purgeAMIs(awsec2 *ec2.EC2, instanceNameTag string, windows []window, s *ses
 	return nil
 }
 
-////////
-// helper to support 2d notation
+// daysToHours is a helper to support 2d notation
 func daysToHours(in string) (string, error) {
 	r, err := regexp.Compile(`^(\d+)d$`)
 	if err != nil {
@@ -324,8 +356,7 @@ func daysToHours(in string) (string, error) {
 	return in, nil
 }
 
-////////
-// handle logging (and nagios-specific output)
+// debug handles logging (and nagios-specific output)
 func (s *session) debug(m string) {
 	if s.debugMode {
 		log.Println(m)
@@ -380,10 +411,9 @@ func (s *session) finish() int {
 	return s.errorLevel
 }
 
-////////
+// handleOptions parses CLI options
 func handleOptions(s *session) {
 	var ok bool
-	// parse cli options
 	arguments, err := docopt.Parse(usage, nil, true, version, false)
 	if err != nil {
 		s.fatal(fmt.Sprintf("Error parsing arguments: %s", err.Error()))

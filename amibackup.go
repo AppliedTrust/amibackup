@@ -3,8 +3,8 @@ package main
 import (
 	"fmt"
 	"github.com/crowdmob/goamz/aws"
+	"github.com/crowdmob/goamz/ec2"
 	"github.com/docopt/docopt-go"
-	"github.com/nmcclain/goamz/ec2"
 	"log"
 	"os"
 	"regexp"
@@ -26,7 +26,7 @@ Options:
   -s, --source=<region>     AWS region of running instance [default: us-east-1].
   -d, --dest=<region>       AWS region to store backup AMI [default: us-west-1].
   -t, --timeout=<secs>      Timeout waiting for AMI creation [default: 1800].
-  -p, --purge=<window>      Comma-separated list of purge windows - see below for details.
+  -p, --purge=<window>      One or more purge windows - see below for details.
   -n, --nagios              Run like a Nagios check.
   -o, --purgeonly           Purge old AMIs without creating new ones.
   -K, --awskey=<keyid>      AWS key ID (or use AWS_ACCESS_KEY_ID environemnt variable).

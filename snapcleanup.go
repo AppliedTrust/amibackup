@@ -16,7 +16,7 @@ const version = "0.1"
 var usage = `snapcleanup: clean up AWS snapshots by trying to delete ALL OF THEM
 
 Usage:
-  snapcleanup [options]
+  snapcleanup [options] <accountid>
   snapcleanup -h --help
   snapcleanup --version
 
@@ -39,6 +39,7 @@ type session struct {
 	region             aws.Region
 	awsAccessKeyId     string
 	awsSecretAccessKey string
+	accountid          string
 }
 
 var regionMap = map[string]aws.Region{
@@ -79,7 +80,7 @@ func main() {
 // purgeAMIs purges AMIs based on name regex
 func purgeAMIs(awsec2 *ec2.EC2, s *session) error {
 	filter := ec2.NewFilter()
-	filter.Add("owner-id", "200691973142")
+	filter.Add("owner-id", s.accountid)
 	snaps, err := awsec2.Snapshots(nil, filter)
 	if err != nil {
 		return fmt.Errorf("EC2 API Snapshots failed: %s", err.Error())
@@ -94,7 +95,7 @@ func purgeAMIs(awsec2 *ec2.EC2, s *session) error {
 			fmt.Printf("EC2 API DeleteSnapshots failed for %s: %s\n", s.Id, err.Error())
 			if strings.Contains(err.Error(), "Request limit exceeded.") {
 				fmt.Printf("Sleeping...\n")
-				time.Sleep(time.Second * 5)
+				time.Sleep(time.Second * 8)
 			}
 			continue
 		}
@@ -113,6 +114,10 @@ func handleOptions(s *session) {
 	s.region, ok = regionMap[arguments["--region"].(string)]
 	if !ok {
 		log.Fatalf("Bad region: %s", arguments["--region"].(string))
+	}
+	s.accountid, ok = arguments["<accountid>"].(string)
+	if !ok {
+		log.Fatalf("Bad accountid: %s", arguments["<accountid>"].(string))
 	}
 	if arguments["--dry-run"].(bool) {
 		s.dryRun = true

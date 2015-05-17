@@ -2,9 +2,9 @@ package main
 
 import (
 	"fmt"
-	"github.com/crowdmob/goamz/aws"
-	"github.com/crowdmob/goamz/ec2"
 	"github.com/docopt/docopt-go"
+	"github.com/mitchellh/goamz/aws"
+	"github.com/mitchellh/goamz/ec2"
 	"log"
 	"os"
 	"regexp"
@@ -13,12 +13,12 @@ import (
 	"time"
 )
 
-const version = "0.7"
+const version = "0.8"
 
 var usage = `amibackup: create cross-region AWS AMI backups
 
 Usage:
-  amibackup [options] [-p <window>]... <instance_name_tag>
+  amibackup [options] [-p <window>]...  [-i <volume>]...  <instance_name_tag>
   amibackup -h --help
   amibackup --version
 
@@ -29,6 +29,7 @@ Options:
   -p, --purge=<window>      One or more purge windows - see below for details.
   -n, --nagios              Run like a Nagios check.
   -o, --purgeonly           Purge old AMIs without creating new ones.
+  -i, --ignore=<volume>     Ignore volume mounted at this mount point - multiple use ok.
   -K, --awskey=<keyid>      AWS key ID (or use AWS_ACCESS_KEY_ID environemnt variable).
   -S, --awssecret=<secret>  AWS secret key (or use AWS_SECRET_ACCESS_KEY environemnt variable).
   --debug                   Enable debugging output.
@@ -70,6 +71,7 @@ type session struct {
 	timeout            time.Duration
 	windows            []window
 	purgeonly          bool
+	ignoreVolumes      []string
 	awsAccessKeyId     string
 	awsSecretAccessKey string
 }
@@ -142,7 +144,7 @@ func main() {
 func findInstances(awsec2 *ec2.EC2, s *session) []ec2.Instance {
 	filter := ec2.NewFilter()
 	filter.Add("tag:Name", s.instanceNameTag)
-	resp, err := awsec2.DescribeInstances(nil, filter)
+	resp, err := awsec2.Instances(nil, filter)
 	if err != nil {
 		s.fatal(fmt.Sprintf("EC2 API DescribeInstances failed: %s", err.Error()))
 	}
@@ -179,7 +181,18 @@ func createAMIs(awsec2 *ec2.EC2, instances []ec2.Instance, s *session) map[strin
 	for _, instance := range instances {
 		backupAmiName := fmt.Sprintf("%s-%s-%s", s.instanceNameTag, timeStamp, instance.InstanceId)
 		backupDesc := fmt.Sprintf("%s %s %s", s.instanceNameTag, timeString, instance.InstanceId)
-		resp, err := awsec2.CreateImage(instance.InstanceId, backupAmiName, backupDesc, true)
+		blockDevices := []ec2.BlockDeviceMapping{}
+		for _, i := range s.ignoreVolumes {
+			blockDevices = append(blockDevices, ec2.BlockDeviceMapping{DeviceName: i, NoDevice: true})
+		}
+		createOpts := ec2.CreateImage{
+			InstanceId:   instance.InstanceId,
+			Name:         backupAmiName,
+			Description:  backupDesc,
+			NoReboot:     true,
+			BlockDevices: blockDevices,
+		}
+		resp, err := awsec2.CreateImage(&createOpts)
 		if err != nil {
 			s.fatal(fmt.Sprintf("Error creating new AMI: %s", err.Error()))
 		}
@@ -238,7 +251,14 @@ func copyAMI(awsec2dest *ec2.EC2, s *session, amis *map[string]string) {
 		for amiId, instanceId := range *amis {
 			backupAmiName := fmt.Sprintf("%s-%s-%s", s.instanceNameTag, timeStamp, amiId)
 			backupDesc := fmt.Sprintf("%s %s %s", s.instanceNameTag, timeString, amiId)
-			copyResp, err := awsec2dest.CopyImage(s.sourceRegion, amiId, backupAmiName, backupDesc)
+			copyOpts := ec2.CopyImage{
+				SourceRegion:  s.sourceRegion.Name,
+				SourceImageId: amiId,
+				Name:          backupAmiName,
+				Description:   backupDesc,
+				ClientToken:   "",
+			}
+			copyResp, err := awsec2dest.CopyImage(&copyOpts)
 			if err != nil {
 				s.fatal("EC2 API CopyImage failed")
 			}
@@ -320,16 +340,16 @@ func purgeAMIs(awsec2 *ec2.EC2, instanceNameTag string, windows []window, s *ses
 					if err != nil {
 						return fmt.Errorf("EC2 API DeregisterImage failed for %s: %s", id, err.Error())
 					}
-					if resp.Response != true {
+					if resp.Return != true {
 						return fmt.Errorf("EC2 API DeregisterImage error for %s", id)
 					}
 					// delete snapshots associated with this AMI.
+					snapids := []string{}
 					for snap, _ := range snaps {
-						_, err := awsec2.DeleteSnapshots(snap)
-						if err != nil {
-							return fmt.Errorf("EC2 API DeleteSnapshots failed for %s: %s", snap, err.Error())
-						}
-						s.debug(fmt.Sprintf("Deleted snapshot: %s (%s)", snap, id))
+						snapids = append(snapids, snap)
+					}
+					if _, err := awsec2.DeleteSnapshots(snapids); err != nil {
+						return fmt.Errorf("EC2 API DeleteSnapshots failed: %s", err.Error())
 					}
 					s.debug(fmt.Sprintf("Purged old AMI %s @ %s (%s->%s)", id, imagesTimes[id].Format(timeShortFormat), window.start.Format(timeShortFormat), window.stop.Format(timeShortFormat)))
 				}
@@ -479,6 +499,9 @@ func handleOptions(s *session) {
 		}
 		newWindow.start = time.Now().Add(-timeAgo)
 		s.windows = append(s.windows, newWindow)
+	}
+	for _, v := range arguments["--ignore"].([]string) {
+		s.ignoreVolumes = append(s.ignoreVolumes, v)
 	}
 	// parse environment variables
 	if len(s.awsAccessKeyId) < 1 {

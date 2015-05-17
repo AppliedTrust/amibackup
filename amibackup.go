@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-const version = "0.8"
+const version = "0.9"
 
 var usage = `amibackup: create cross-region AWS AMI backups
 
@@ -344,12 +344,10 @@ func purgeAMIs(awsec2 *ec2.EC2, instanceNameTag string, windows []window, s *ses
 						return fmt.Errorf("EC2 API DeregisterImage error for %s", id)
 					}
 					// delete snapshots associated with this AMI.
-					snapids := []string{}
 					for snap, _ := range snaps {
-						snapids = append(snapids, snap)
-					}
-					if _, err := awsec2.DeleteSnapshots(snapids); err != nil {
-						return fmt.Errorf("EC2 API DeleteSnapshots failed: %s", err.Error())
+						if _, err := awsec2.DeleteSnapshots([]string{snap}); err != nil {
+							return fmt.Errorf("EC2 API DeleteSnapshot failed: %s", err.Error())
+						}
 					}
 					s.debug(fmt.Sprintf("Purged old AMI %s @ %s (%s->%s)", id, imagesTimes[id].Format(timeShortFormat), window.start.Format(timeShortFormat), window.stop.Format(timeShortFormat)))
 				}

@@ -152,6 +152,7 @@ body {
 									<th>Instance Id</th>
 									<th>When</th>
 									<th>Relative</th>
+									<th></th>
                 </tr>
               </thead>
               <tbody>
@@ -161,6 +162,7 @@ body {
 									<td>{{ $a.InstanceId }}</td>
 									<td>{{ $a.When }}</td>
 									<td>{{ $a.Relative }}</td>
+									<td><a class="btn btn-primary btn-xs" href="https://console.aws.amazon.com/ec2/v2/home?region={{ $.Session.DestRegion.Name }}#LaunchInstanceWizard:ami={{ $a.Id }}" role="button">Launch</a></td>
                 </tr>
 								{{ end }}
               </tbody>
@@ -178,6 +180,7 @@ body {
 									<th>Instance Id</th>
 									<th>When</th>
 									<th>Relative</th>
+									<th></th>
                 </tr>
               </thead>
               <tbody>
@@ -187,6 +190,7 @@ body {
 									<td>{{ $a.InstanceId }}</td>
 									<td>{{ $a.When }}</td>
 									<td>{{ $a.Relative }}</td>
+									<td><a class="btn btn-primary btn-xs" href="https://console.aws.amazon.com/ec2/v2/home?region={{ $.Session.DestRegion.Name }}#LaunchInstanceWizard:ami={{ $a.Id }}" role="button">Launch</a></td>
                 </tr>
 								{{ end }}
               </tbody>

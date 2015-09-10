@@ -1,3 +1,4 @@
+![Supported](https://img.shields.io/badge/development_status-supported-brightgreen.svg) ![License BSDv2](https://img.shields.io/badge/license-BSDv2-brightgreen.svg)
 ##amibackup: create cross-region AWS AMI backups
 
 ```

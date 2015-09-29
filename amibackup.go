@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-const version = "0.9"
+const version = "0.10-20150929"
 
 var usage = `amibackup: create cross-region AWS AMI backups
 
@@ -108,12 +108,12 @@ func main() {
 	if len(s.windows) > 0 {
 		err := purgeAMIs(awsec2, s.instanceNameTag, s.windows, s)
 		if err != nil {
-			s.warning(fmt.Sprintf("Error purging old AMIs: %s", err.Error()))
+			s.debug(fmt.Sprintf("Error purging old AMIs: %s", err.Error()))
 		}
 		if s.destRegion.Name != s.sourceRegion.Name {
 			err = purgeAMIs(awsec2dest, s.instanceNameTag, s.windows, s)
 			if err != nil {
-				s.warning(fmt.Sprintf("Error purging old AMIs: %s", err.Error()))
+				s.debug(fmt.Sprintf("Error purging old AMIs: %s", err.Error()))
 			}
 		}
 	}

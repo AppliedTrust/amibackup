@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-const version = "0.11-20160105"
+const version = "0.12-20160106"
 
 var usage = `amibackup: create cross-region AWS AMI backups
 
@@ -320,12 +320,16 @@ func purgeAMIs(awsec2 *ec2.EC2, s *session) error {
 	for _, window := range s.windows {
 		s.debug(fmt.Sprintf("Window: 1 per %s from %s-%s", window.interval.String(), window.start, window.stop))
 		for cursor := window.start; cursor.Before(window.stop); cursor = cursor.Add(window.interval) {
+			cursorEnd := cursor.Add(window.interval)
+			if cursorEnd.After(window.stop) {
+				cursorEnd = window.stop
+			}
 			imagesInThisInterval := []string{}
 			imagesTimes := make(map[string]time.Time)
 			oldestImage := ""
 			oldestImageTime := time.Now()
 			for id, when := range images {
-				if when.After(cursor) && when.Before(cursor.Add(window.interval)) {
+				if when.After(cursor) && when.Before(cursorEnd) {
 					imagesInThisInterval = append(imagesInThisInterval, id)
 					imagesTimes[id] = when
 					if when.Before(oldestImageTime) {
@@ -523,6 +527,7 @@ func handleOptions(s *session) {
 		newWindow.start = time.Now().Add(-timeAgo)
 		s.windows = append(s.windows, newWindow)
 	}
+
 	for _, v := range arguments["--ignore"].([]string) {
 		s.ignoreVolumes = append(s.ignoreVolumes, v)
 	}

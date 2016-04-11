@@ -2,44 +2,40 @@ package main
 
 import (
 	"fmt"
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go/service/ec2"
 	"github.com/docopt/docopt-go"
-	"github.com/mitchellh/goamz/aws"
-	"github.com/mitchellh/goamz/ec2"
 	"log"
-	"os"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
 )
 
-const version = "0.12-20160106"
+const version = "0.13-20160411"
 
 var usage = `amibackup: create cross-region AWS AMI backups
 
 Usage:
-  amibackup [options] [-p <window>]...  [-i <volume>]...  <instance_name_tag>
+  amibackup [options] [-p <window>]...  [-i <volume>]...  <instance_name_tag>...
   amibackup -h --help
   amibackup --version
 
 Options:
   -s, --source=<region>     AWS region of running instance [default: us-east-1].
   -d, --dest=<region>       AWS region to store backup AMI [default: us-west-1].
-  -t, --timeout=<secs>      Timeout waiting for AMI creation [default: 1800].
+  -t, --timeout=<secs>      Timeout waiting for AMI creation [default: 30m].
   -p, --purge=<window>      One or more purge windows - see below for details.
-  -n, --nagios              Run like a Nagios check.
   -o, --purgeonly           Purge old AMIs without creating new ones.
   -D, --dry-run             Do not actually create or purge anything, just say what would have happened.
   -i, --ignore=<volume>     Ignore volume mounted at this mount point - multiple use ok.
-  -K, --awskey=<keyid>      AWS key ID (or use AWS_ACCESS_KEY_ID environemnt variable).
-  -S, --awssecret=<secret>  AWS secret key (or use AWS_SECRET_ACCESS_KEY environemnt variable).
-  --debug                   Enable debugging output.
   --version                 Show version.
   -h, --help                Show this screen.
 
 AWS Authentication:
-  Either use the -K and -S flags, or
-  set the AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY environment variables.
+  Either setup a ~/.aws/credentials file (~/.aws/config NOT supported)
+	OR set the AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY environment variables.
 
 Purge windows:
   Delete old AMIs (and associated snapshots) based on the Purge windows you define.
@@ -54,40 +50,26 @@ Purge windows:
   -p 1d:4d:30d -p 7d:30d:90d -p 30d:90d:180d   Keep all for past 4 days, 1/day for past 30 days, 1/week for past 90 days, 1/mo forever.
 `
 
-var apiPollInterval = 5 * time.Second
+var apiPollInterval = 15 * time.Second
 
 type window struct {
 	interval time.Duration
 	start    time.Time
 	stop     time.Time
 }
-type session struct {
-	debugMode          bool
-	nagiosMode         bool
+type Config struct {
 	dryRun             bool
 	errorLevel         int
-	nagiosMessages     []string
-	instanceNameTag    string
-	sourceRegion       aws.Region
-	destRegion         aws.Region
+	instanceNameTags   []string
+	sourceRegion       string
+	destRegion         string
+	timeoutString      string
 	timeout            time.Duration
 	windows            []window
 	purgeonly          bool
 	ignoreVolumes      []string
 	awsAccessKeyId     string
 	awsSecretAccessKey string
-}
-
-var regionMap = map[string]aws.Region{
-	"us-gov-west-1":  aws.USGovWest,
-	"us-east-1":      aws.USEast,
-	"us-west-1":      aws.USWest,
-	"us-west-2":      aws.USWest2,
-	"eu-west-1":      aws.EUWest,
-	"ap-southeast-1": aws.APSoutheast,
-	"ap-southeast-2": aws.APSoutheast2,
-	"ap-northeast-1": aws.APNortheast,
-	"sa-east-1":      aws.SAEast,
 }
 
 // time formatting
@@ -97,64 +79,96 @@ var timeShortFormat = "01/02/2006@15:04:05"
 var timeString = time.Now().Format("2006-01-02 15:04:05 -0700")
 
 func main() {
-	s := &session{}
-
-	handleOptions(s)
+	c := handleOptions()
+	go func() {
+		time.Sleep(c.timeout)
+		log.Fatalf("Hit timeout of %s before we finished - goodbye!", c.timeoutString)
+	}()
 
 	// connect to AWS
-	auth := aws.Auth{AccessKey: s.awsAccessKeyId, SecretKey: s.awsSecretAccessKey}
-	awsec2 := ec2.New(auth, s.sourceRegion)
-	awsec2dest := ec2.New(auth, s.destRegion)
+	awsec2 := ec2.New(session.New(), &aws.Config{Region: aws.String(c.sourceRegion)})
+	awsec2dest := ec2.New(session.New(), &aws.Config{Region: aws.String(c.destRegion)})
 
 	// purge old AMIs and snapshots in both regions
-	if len(s.windows) > 0 {
-		err := purgeAMIs(awsec2, s)
-		if err != nil {
-			s.debug(fmt.Sprintf("Error purging old AMIs: %s", err.Error()))
-		}
-		if s.destRegion.Name != s.sourceRegion.Name {
-			err = purgeAMIs(awsec2dest, s)
+	if len(c.windows) > 0 {
+		for _, instanceNameTag := range c.instanceNameTags {
+			err := purgeAMIs(awsec2, c.sourceRegion, instanceNameTag, c)
 			if err != nil {
-				s.debug(fmt.Sprintf("Error purging old AMIs: %s", err.Error()))
+				log.Printf("Error purging old AMIs for %s in %s: %s", instanceNameTag, c.sourceRegion, err.Error())
+			}
+			if c.destRegion != c.sourceRegion {
+				err = purgeAMIs(awsec2dest, c.destRegion, instanceNameTag, c)
+				if err != nil {
+					log.Printf("Error purging old AMIs for %s in %s: %s", instanceNameTag, c.destRegion, err.Error())
+				}
 			}
 		}
 	}
-	if s.purgeonly {
-		s.ok("Purging done and --purgeonly specified - exiting.")
-		os.Exit(s.finish())
+	if c.purgeonly {
+		log.Printf("Purging done and --purgeonly specified - exiting.")
+		return
 	}
 
 	// search for our instances
-	instances := findInstances(awsec2, s)
-	if len(instances) < 1 {
-		s.fatal(fmt.Sprintf("No instances with matching name tag: %s", s.instanceNameTag))
-	} else {
-		s.debug(fmt.Sprintf("Found %d instances with matching Name tag: %s", len(instances), s.instanceNameTag))
+	instanceset := map[string][]*ec2.Instance{}
+	for _, instanceNameTag := range c.instanceNameTags {
+		instanceset[instanceNameTag] = findInstances(awsec2, instanceNameTag)
+		if len(instanceset[instanceNameTag]) < 1 {
+			log.Fatalf("No instances with matching name tag: %s", instanceNameTag)
+		} else {
+			log.Printf("Found %d instances with matching Name tag: %s", len(instanceset[instanceNameTag]), instanceNameTag)
+		}
 	}
 
-	// create local AMIs
-	newAMIs := createAMIs(awsec2, instances, s)
+	done := make(chan string)
+	i := 0
+	for instanceNameTag, instances := range instanceset {
+		for _, instance := range instances {
+			i++
+			instanceNameTag := instanceNameTag
+			instance := instance
+			go func() {
+				defer func() {
+					done <- instanceNameTag
+				}()
+				// create local AMI
+				newAMI, err := createAMI(awsec2, instance, c, instanceNameTag)
+				if err != nil {
+					log.Printf("Error creating AMI for %s: %s", instanceNameTag, err.Error())
+					return
+				}
 
-	// create AMIs to backup region
-	if !s.dryRun {
-		copyAMI(awsec2dest, s, &newAMIs)
-	} else {
-		s.debug(fmt.Sprintf("DRYRUN: would have copied new AMIs from %s to %s", s.sourceRegion.Name, s.destRegion.Name))
+				// copy AMI to backup region
+				if err := copyAMI(awsec2dest, c, newAMI, instance, instanceNameTag); err != nil {
+					log.Printf("Error copying AMI for %s: %s", instanceNameTag, err.Error())
+					return
+				}
+			}()
+		}
 	}
 
-	// this finish() call gives us nagios output, if desired
-	os.Exit(s.finish())
+	for _, instances := range instanceset {
+		for _, _ = range instances {
+			n := <-done // wait for everyone to finish
+			log.Printf("All done with %s", n)
+		}
+	}
+	log.Printf("All done!")
 }
 
-// findInstances searches for our instances
-func findInstances(awsec2 *ec2.EC2, s *session) []ec2.Instance {
-	filter := ec2.NewFilter()
-	filter.Add("tag:Name", s.instanceNameTag)
-	resp, err := awsec2.Instances(nil, filter)
-	if err != nil {
-		s.fatal(fmt.Sprintf("EC2 API DescribeInstances failed: %s", err.Error()))
+// findInstances searches for our instances by "Name" tag
+func findInstances(awsec2 *ec2.EC2, instanceNameTag string) []*ec2.Instance {
+	params := &ec2.DescribeInstancesInput{
+		Filters: []*ec2.Filter{{
+			Name:   aws.String("tag:Name"),
+			Values: []*string{aws.String(instanceNameTag)},
+		}},
 	}
-	instances := []ec2.Instance{}
+	resp, err := awsec2.DescribeInstances(params)
+	if err != nil {
+		log.Fatalf("EC2 API DescribeInstances failed: %s", err.Error())
+	}
+	instances := []*ec2.Instance{}
 	for _, reservation := range resp.Reservations {
 		for _, instance := range reservation.Instances {
 			instances = append(instances, instance)
@@ -166,159 +180,166 @@ func findInstances(awsec2 *ec2.EC2, s *session) []ec2.Instance {
 // findSnapshots returns a map of snapshots associated with an AMI
 func findSnapshots(amiid string, awsec2 *ec2.EC2) (map[string]string, error) {
 	snaps := make(map[string]string)
-	resp, err := awsec2.Images([]string{amiid}, nil)
+	resp, err := awsec2.DescribeImages(&ec2.DescribeImagesInput{ImageIds: []*string{aws.String(amiid)}})
 	if err != nil {
 		return snaps, fmt.Errorf("EC2 API DescribeImages failed: %s", err.Error())
 	}
 	for _, image := range resp.Images {
-		for _, bd := range image.BlockDevices {
-			if len(bd.SnapshotId) > 0 {
-				snaps[bd.SnapshotId] = bd.DeviceName
+		for _, bd := range image.BlockDeviceMappings {
+			if bd.Ebs != nil && len(*bd.Ebs.SnapshotId) > 0 {
+				snaps[*bd.Ebs.SnapshotId] = *bd.DeviceName
 			}
 		}
 	}
 	return snaps, nil
 }
 
-// createAMIs actually creates the AMI(s)
-func createAMIs(awsec2 *ec2.EC2, instances []ec2.Instance, s *session) map[string]string {
-	newAMIs := make(map[string]string)
-	pendingAMIs := make(map[string]bool)
-	for _, instance := range instances {
-		backupAmiName := fmt.Sprintf("%s-%s-%s", s.instanceNameTag, timeStamp, instance.InstanceId)
-		backupDesc := fmt.Sprintf("%s %s %s", s.instanceNameTag, timeString, instance.InstanceId)
-		blockDevices := []ec2.BlockDeviceMapping{}
-		for _, i := range s.ignoreVolumes {
-			blockDevices = append(blockDevices, ec2.BlockDeviceMapping{DeviceName: i, NoDevice: true})
-		}
-		createOpts := ec2.CreateImage{
-			InstanceId:   instance.InstanceId,
-			Name:         backupAmiName,
-			Description:  backupDesc,
-			NoReboot:     true,
-			BlockDevices: blockDevices,
-		}
-		if !s.dryRun {
-			resp, err := awsec2.CreateImage(&createOpts)
-			if err != nil {
-				s.fatal(fmt.Sprintf("Error creating new AMI: %s", err.Error()))
-			}
-			_, err = awsec2.CreateTags([]string{resp.ImageId}, []ec2.Tag{
-				{"hostname", s.instanceNameTag},
-				{"instance", instance.InstanceId},
-				{"date", timeString},
-				{"timestamp", timeSecs},
-			})
-			if err != nil {
-				s.fatal(fmt.Sprintf("Error tagging new AMI: %s", err.Error()))
-			}
-			newAMIs[resp.ImageId] = instance.InstanceId
-			pendingAMIs[resp.ImageId] = true
-			s.debug(fmt.Sprintf("Creating new AMI %s for %s (%s)", resp.ImageId, s.instanceNameTag, instance.InstanceId))
-		} else {
-			s.debug(fmt.Sprintf("DRYRUN: would have created AMI for: %s (%s)", s.instanceNameTag, instance.InstanceId))
-		}
-	}
+// createAMI actually creates the AMI
+func createAMI(awsec2 *ec2.EC2, instance *ec2.Instance, c *Config, instanceNameTag string) (string, error) {
+	newAMI := ""
 
-	// wait for AMIs to be ready
-	done := make(chan bool)
-	go func() {
-		for len(pendingAMIs) > 0 {
-			s.debug(fmt.Sprintf("Sleeping for %d pending AMIs", len(pendingAMIs)))
-			time.Sleep(apiPollInterval)
-			list := []string{}
-			for k, _ := range pendingAMIs {
-				list = append(list, k)
-			}
-			images, err := awsec2.Images(list, nil)
-			if err != nil {
-				s.fatal("EC2 API Images failed")
-			}
-			for _, image := range images.Images {
-				if image.State == "available" {
-					delete(pendingAMIs, image.Id)
-					s.ok(fmt.Sprintf("Created new AMI %s", image.Id))
-				}
-			}
-		}
-		done <- true
-	}()
-	select {
-	case <-done:
-	case <-time.After(s.timeout):
-		list := []string{}
-		for k, _ := range pendingAMIs {
-			list = append(list, k)
-		}
-		s.fatal(fmt.Sprintf("Timeout waiting for AMIs in region %s: %s", s.sourceRegion.Name, strings.Join(list, " ,")))
+	backupAmiName := fmt.Sprintf("%s-%s-%s", instanceNameTag, timeStamp, *instance.InstanceId)
+	backupDesc := fmt.Sprintf("%s %s %s", instanceNameTag, timeString, *instance.InstanceId)
+	blockDevices := []*ec2.BlockDeviceMapping{}
+	for _, i := range c.ignoreVolumes {
+		blockDevices = append(blockDevices, &ec2.BlockDeviceMapping{DeviceName: aws.String(i), NoDevice: aws.String("")})
 	}
-	return newAMIs
+	params := &ec2.CreateImageInput{
+		InstanceId:  instance.InstanceId,
+		Name:        aws.String(backupAmiName),
+		Description: aws.String(backupDesc),
+		NoReboot:    aws.Bool(true),
+	}
+	if len(blockDevices) > 0 {
+		params.BlockDeviceMappings = blockDevices
+	}
+	if !c.dryRun {
+		resp, err := awsec2.CreateImage(params)
+		if err != nil {
+			return newAMI, fmt.Errorf("Error creating new AMI named %s for instance %s: %s", backupAmiName, *instance.InstanceId, err.Error())
+		}
+		newAMI = *resp.ImageId
+		log.Printf("Creating new AMI %s for %s (%s)", *resp.ImageId, instanceNameTag, *instance.InstanceId)
+	} else {
+		log.Printf("DRYRUN: would have created AMI for: %s (%s)", instanceNameTag, *instance.InstanceId)
+	}
+	if err := waitForAMI(awsec2, newAMI, instanceNameTag, false); err != nil {
+		return newAMI, err
+	}
+	log.Printf("Created new AMI %s in region %s", newAMI, c.sourceRegion)
+
+	// tag the AMI
+	_, err := awsec2.CreateTags(&ec2.CreateTagsInput{
+		Resources: []*string{aws.String(newAMI)},
+		Tags: []*ec2.Tag{
+			{Key: aws.String("hostname"), Value: aws.String(instanceNameTag)},
+			{Key: aws.String("instance"), Value: instance.InstanceId},
+			{Key: aws.String("date"), Value: aws.String(timeString)},
+			{Key: aws.String("timestamp"), Value: aws.String(timeSecs)},
+		},
+	})
+	return newAMI, err
+}
+
+// wait for AMI to be ready
+func waitForAMI(awsec2 *ec2.EC2, newAMI, instanceNameTag string, isCopy bool) error {
+	jobstate := "new"
+	for {
+		if isCopy {
+			log.Printf("Waiting for %s AMI copy %s for %s", jobstate, newAMI, instanceNameTag)
+		} else {
+			log.Printf("Waiting for %s AMI %s for %s", jobstate, newAMI, instanceNameTag)
+		}
+		time.Sleep(apiPollInterval)
+		resp, err := awsec2.DescribeImages(&ec2.DescribeImagesInput{ImageIds: []*string{aws.String(newAMI)}})
+		if err != nil {
+			log.Printf("Error waiting for new AMI %s for instance %s (trying again): %s", newAMI, instanceNameTag, err.Error())
+			continue
+		}
+		for _, image := range resp.Images {
+			jobstate = *image.State
+			if jobstate == "available" {
+				return nil
+			}
+		}
+	}
 }
 
 // copyAMI starts the AMI copy
-func copyAMI(awsec2dest *ec2.EC2, s *session, amis *map[string]string) {
-	if s.destRegion.Name != s.sourceRegion.Name {
-		for amiId, instanceId := range *amis {
-			backupAmiName := fmt.Sprintf("%s-%s-%s", s.instanceNameTag, timeStamp, amiId)
-			backupDesc := fmt.Sprintf("%s %s %s", s.instanceNameTag, timeString, amiId)
-			copyOpts := ec2.CopyImage{
-				SourceRegion:  s.sourceRegion.Name,
-				SourceImageId: amiId,
-				Name:          backupAmiName,
-				Description:   backupDesc,
-				ClientToken:   "",
-			}
-			copyResp, err := awsec2dest.CopyImage(&copyOpts)
-			if err != nil {
-				s.fatal("EC2 API CopyImage failed")
-			}
-			s.debug(fmt.Sprintf("Started copy of %s from %s (%s) to %s (%s).", s.instanceNameTag, s.sourceRegion.Name, amiId, s.destRegion.Name, copyResp.ImageId))
-			_, err = awsec2dest.CreateTags([]string{copyResp.ImageId}, []ec2.Tag{
-				{"hostname", s.instanceNameTag},
-				{"instance", instanceId},
-				{"sourceregion", s.sourceRegion.Name},
-				{"date", timeString},
-				{"timestamp", timeSecs},
-			})
-			if err != nil {
-				s.fatal(fmt.Sprintf("Error tagging new AMI: %s", err.Error()))
-			}
-		}
-	} else {
-		s.debug("Not copying AMI - source and dest regions match")
+func copyAMI(awsec2dest *ec2.EC2, c *Config, amiId string, instance *ec2.Instance, instanceNameTag string) error {
+	if c.dryRun {
+		log.Printf("DRYRUN: would have copied new AMI from %s to %s", c.sourceRegion, c.destRegion)
+		return nil
 	}
+	if c.destRegion != c.sourceRegion {
+		backupAmiName := fmt.Sprintf("%s-%s-%s", instanceNameTag, timeStamp, amiId)
+		backupDesc := fmt.Sprintf("%s %s %s", instanceNameTag, timeString, amiId)
+		copyResp, err := awsec2dest.CopyImage(&ec2.CopyImageInput{
+			SourceRegion:  aws.String(c.sourceRegion),
+			SourceImageId: aws.String(amiId),
+			Name:          aws.String(backupAmiName),
+			Description:   aws.String(backupDesc),
+			ClientToken:   aws.String(""),
+		})
+		if err != nil {
+			return fmt.Errorf("CopyImage failed: %s", err.Error())
+		}
+		log.Printf("Started copy of %s from %s (%s) to %s (%s).", instanceNameTag, c.sourceRegion, amiId, c.destRegion, *copyResp.ImageId)
+		time.Sleep(apiPollInterval)
+		_, err = awsec2dest.CreateTags(&ec2.CreateTagsInput{
+			Resources: []*string{copyResp.ImageId},
+			Tags: []*ec2.Tag{
+				{Key: aws.String("hostname"), Value: aws.String(instanceNameTag)},
+				{Key: aws.String("instance"), Value: instance.InstanceId},
+				{Key: aws.String("sourceregion"), Value: aws.String(c.sourceRegion)},
+				{Key: aws.String("date"), Value: aws.String(timeString)},
+				{Key: aws.String("timestamp"), Value: aws.String(timeSecs)},
+			},
+		})
+		if err != nil {
+			return fmt.Errorf("Error tagging new AMI: %s", err.Error())
+		}
+		if err := waitForAMI(awsec2dest, *copyResp.ImageId, instanceNameTag, true); err != nil {
+			return err
+		}
+		log.Printf("Finished copy of %s from %s (%s) to %s (%s).", instanceNameTag, c.sourceRegion, amiId, c.destRegion, *copyResp.ImageId)
+	} else {
+		log.Printf("Not copying AMI %s - source and dest regions match", amiId)
+	}
+	return nil
 }
 
 // purgeAMIs purges AMIs based on specified windows
-func purgeAMIs(awsec2 *ec2.EC2, s *session) error {
-	filter := ec2.NewFilter()
-	filter.Add("tag:hostname", s.instanceNameTag)
-	imageList, err := awsec2.Images(nil, filter)
+func purgeAMIs(awsec2 *ec2.EC2, regionName, instanceNameTag string, c *Config) error {
+	resp, err := awsec2.DescribeImages(&ec2.DescribeImagesInput{Filters: []*ec2.Filter{{
+		Name:   aws.String("tag:hostname"),
+		Values: []*string{aws.String(instanceNameTag)},
+	}}})
 	if err != nil {
 		return fmt.Errorf("EC2 API Images failed: %s", err.Error())
 	}
-	s.debug(fmt.Sprintf("Found %d total images for %s in %s", len(imageList.Images), s.instanceNameTag, awsec2.Region.Name))
+	log.Printf("Found %d total images for %s in %s", len(resp.Images), instanceNameTag, regionName)
 	images := map[string]time.Time{}
-	for _, image := range imageList.Images {
+	for _, image := range resp.Images {
 		timestampTag := ""
 		for _, tag := range image.Tags {
-			if tag.Key == "timestamp" {
-				timestampTag = tag.Value
+			if *tag.Key == "timestamp" {
+				timestampTag = *tag.Value
 			}
 		}
 		if len(timestampTag) < 1 {
-			s.debug(fmt.Sprintf("AMI is missing timestamp tag - skipping: %s", image.Id))
+			log.Printf("AMI is missing timestamp tag - skipping: %s", image.ImageId)
 			continue
 		}
 		timestamp, err := strconv.ParseInt(timestampTag, 10, 64)
 		if err != nil {
-			s.debug(fmt.Sprintf("AMI timestamp tag is corrupt - skipping: %s", image.Id))
+			log.Printf("AMI timestamp tag is corrupt - skipping: %s", image.ImageId)
 			continue
 		}
-		images[image.Id] = time.Unix(timestamp, 0)
+		images[*image.ImageId] = time.Unix(timestamp, 0)
 	}
-	for _, window := range s.windows {
-		s.debug(fmt.Sprintf("Window: 1 per %s from %s-%s", window.interval.String(), window.start, window.stop))
+	for _, window := range c.windows {
+		log.Printf("Window: 1 per %s from %s-%s", window.interval.String(), window.start, window.stop)
 		for cursor := window.start; cursor.Before(window.stop); cursor = cursor.Add(window.interval) {
 			cursorEnd := cursor.Add(window.interval)
 			if cursorEnd.After(window.stop) {
@@ -341,7 +362,7 @@ func purgeAMIs(awsec2 *ec2.EC2, s *session) error {
 			if len(imagesInThisInterval) > 1 {
 				for _, id := range imagesInThisInterval {
 					if id == oldestImage { // keep the oldest one
-						s.debug(fmt.Sprintf("Keeping oldest AMI in this window: %s @ %s (%s->%s)", id, imagesTimes[id].Format(timeShortFormat), window.start.Format(timeShortFormat), window.stop.Format(timeShortFormat)))
+						log.Printf("Keeping oldest AMI in this window: %s @ %s (%s->%s)", id, imagesTimes[id].Format(timeShortFormat), window.start.Format(timeShortFormat), window.stop.Format(timeShortFormat))
 						continue
 					}
 					// find snapshots associated with this AMI.
@@ -350,31 +371,28 @@ func purgeAMIs(awsec2 *ec2.EC2, s *session) error {
 						return fmt.Errorf("EC2 API findSnapshots failed for %s: %s", id, err.Error())
 					}
 					// deregister the AMI.
-					if !s.dryRun {
-						resp, err := awsec2.DeregisterImage(id)
+					if !c.dryRun {
+						_, err := awsec2.DeregisterImage(&ec2.DeregisterImageInput{ImageId: aws.String(id)})
 						if err != nil {
 							return fmt.Errorf("EC2 API DeregisterImage failed for %s: %s", id, err.Error())
 						}
-						if resp.Return != true {
-							return fmt.Errorf("EC2 API DeregisterImage error for %s", id)
-						}
 					} else {
-						s.debug(fmt.Sprintf("DRYRUN: would have deregistered image ID: %s", id))
+						log.Printf("DRYRUN: would have deregistered image ID: %s", id)
 					}
 					// delete snapshots associated with this AMI.
 					for snap, _ := range snaps {
-						if !s.dryRun {
-							if _, err := awsec2.DeleteSnapshots([]string{snap}); err != nil {
-								return fmt.Errorf("EC2 API DeleteSnapshot failed: %s", err.Error())
+						if !c.dryRun {
+							if _, err := awsec2.DeleteSnapshot(&ec2.DeleteSnapshotInput{SnapshotId: aws.String(snap)}); err != nil {
+								return fmt.Errorf("EC2 API DeleteSnapshot failed for %s: %s", snap, err.Error())
 							}
 						} else {
-							s.debug(fmt.Sprintf("DRYRUN: would have deleted snapshot ID: %s", snap))
+							log.Printf("DRYRUN: would have deleted snapshot ID: %s", snap)
 						}
 					}
-					if !s.dryRun {
-						s.debug(fmt.Sprintf("Purged old AMI %s @ %s (%s->%s)", id, imagesTimes[id].Format(timeShortFormat), window.start.Format(timeShortFormat), window.stop.Format(timeShortFormat)))
+					if !c.dryRun {
+						log.Printf("Purged old AMI %s @ %s (%s->%s)", id, imagesTimes[id].Format(timeShortFormat), window.start.Format(timeShortFormat), window.stop.Format(timeShortFormat))
 					} else {
-						s.debug(fmt.Sprintf("DRYRUN: would have purged old AMI %s @ %s (%s->%s)", id, imagesTimes[id].Format(timeShortFormat), window.start.Format(timeShortFormat), window.stop.Format(timeShortFormat)))
+						log.Printf("DRYRUN: would have purged old AMI %s @ %s (%s->%s)", id, imagesTimes[id].Format(timeShortFormat), window.start.Format(timeShortFormat), window.stop.Format(timeShortFormat))
 					}
 				}
 			}
@@ -400,145 +418,64 @@ func daysToHours(in string) (string, error) {
 	return in, nil
 }
 
-// debug handles logging (and nagios-specific output)
-func (s *session) debug(m string) {
-	if s.debugMode {
-		log.Println(m)
-	}
-}
-func (s *session) fatal(m string) {
-	s.errorLevel = 2
-	if s.nagiosMode {
-		fmt.Printf("AMIbackup CRITICAL: %s\n", m)
-	} else {
-		log.Println(m)
-	}
-	os.Exit(s.errorLevel)
-}
-func (s *session) warning(m string) {
-	if s.errorLevel < 1 {
-		s.errorLevel = 1
-	}
-	if s.nagiosMode {
-		s.nagiosMessages = append(s.nagiosMessages, m)
-		if s.debugMode {
-			log.Println(m)
-		}
-	} else {
-		log.Println(m)
-	}
-}
-func (s *session) ok(m string) {
-	if s.nagiosMode {
-		s.nagiosMessages = append(s.nagiosMessages, m)
-		if s.debugMode {
-			log.Println(m)
-		}
-	} else {
-		log.Println(m)
-	}
-}
-func (s *session) finish() int {
-	if s.nagiosMode {
-		messages := strings.Join(s.nagiosMessages, ", ")
-		if s.errorLevel < 1 {
-			fmt.Printf("AMIbackup OK: %s\n", messages)
-		} else if s.errorLevel < 2 {
-			fmt.Printf("AMIbackup WARNING: %s\n", messages)
-		} else {
-			fmt.Printf("AMIbackup CRITICAL: %s\n", messages)
-		}
-	}
-	if s.debugMode {
-		log.Println("Done")
-	}
-	return s.errorLevel
-}
-
 // handleOptions parses CLI options
-func handleOptions(s *session) {
-	var ok bool
+func handleOptions() *Config {
+	c := Config{}
 	arguments, err := docopt.Parse(usage, nil, true, version, false)
 	if err != nil {
-		s.fatal(fmt.Sprintf("Error parsing arguments: %s", err.Error()))
+		log.Fatalf("Error parsing arguments: %s", err.Error())
 	}
-	s.instanceNameTag = arguments["<instance_name_tag>"].(string)
-	s.sourceRegion, ok = regionMap[arguments["--source"].(string)]
-	if !ok {
-		s.fatal(fmt.Sprintf("Bad region: %s", arguments["--source"].(string)))
-	}
-	s.destRegion, ok = regionMap[arguments["--dest"].(string)]
-	if !ok {
-		s.fatal(fmt.Sprintf("Bad region: %s", arguments["--dest"].(string)))
-	}
-	s.timeout, err = time.ParseDuration(arguments["--timeout"].(string) + "s")
+	c.instanceNameTags = arguments["<instance_name_tag>"].([]string)
+	c.sourceRegion = arguments["--source"].(string)
+	c.destRegion = arguments["--dest"].(string)
+	c.timeoutString = arguments["--timeout"].(string)
+	c.timeout, err = time.ParseDuration(c.timeoutString)
 	if err != nil {
-		s.fatal(fmt.Sprintf("Invalid timeout: %s", arguments["--timeout"].(string)))
-	}
-	if arguments["--nagios"].(bool) {
-		s.nagiosMode = true
-	}
-	if arguments["--debug"].(bool) {
-		s.debugMode = true
+		log.Fatalf("Invalid timeout: %s", arguments["--timeout"].(string))
 	}
 	if arguments["--purgeonly"].(bool) {
-		s.purgeonly = true
+		c.purgeonly = true
 	}
 	if arguments["--dry-run"].(bool) {
-		s.dryRun = true
-	}
-	if arg, ok := arguments["--awskey"].(string); ok {
-		s.awsAccessKeyId = arg
-	}
-	if arg, ok := arguments["--awssecret"].(string); ok {
-		s.awsSecretAccessKey = arg
+		c.dryRun = true
 	}
 	for _, w := range arguments["--purge"].([]string) {
 		newWindow := window{}
 		parts := strings.Split(w, ":")
 		if len(parts) != 3 {
-			s.fatal(fmt.Sprintf("Malformed purge window: %s", w))
+			log.Fatalf("Malformed purge window: %s", w)
 		}
 		converted, err := daysToHours(parts[0])
 		if err != nil {
-			s.fatal(fmt.Sprintf("Malformed purge window interval: %s %s", w, err.Error()))
+			log.Fatalf("Malformed purge window interval: %s %s", w, err.Error())
 		}
 		newWindow.interval, err = time.ParseDuration(converted)
 		if err != nil {
-			s.fatal(fmt.Sprintf("Malformed purge window interval: %s %s", w, err.Error()))
+			log.Fatalf("Malformed purge window interval: %s %s", w, err.Error())
 		}
 		converted, err = daysToHours(parts[1])
 		if err != nil {
-			s.fatal(fmt.Sprintf("Malformed purge window start: %s %s", w, err.Error()))
+			log.Fatalf("Malformed purge window start: %s %s", w, err.Error())
 		}
 		timeAgo, err := time.ParseDuration(converted)
 		if err != nil {
-			s.fatal(fmt.Sprintf("Malformed purge window start: %s %s", w, err.Error()))
+			log.Fatalf("Malformed purge window start: %s %s", w, err.Error())
 		}
 		newWindow.stop = time.Now().Add(-timeAgo)
 		converted, err = daysToHours(parts[2])
 		if err != nil {
-			s.fatal(fmt.Sprintf("Malformed purge window stop: %s %s", w, err.Error()))
+			log.Fatalf("Malformed purge window stop: %s %s", w, err.Error())
 		}
 		timeAgo, err = time.ParseDuration(converted)
 		if err != nil {
-			s.fatal(fmt.Sprintf("Malformed purge window stop: %s %s", w, err.Error()))
+			log.Fatalf("Malformed purge window stop: %s %s", w, err.Error())
 		}
 		newWindow.start = time.Now().Add(-timeAgo)
-		s.windows = append(s.windows, newWindow)
+		c.windows = append(c.windows, newWindow)
 	}
 
 	for _, v := range arguments["--ignore"].([]string) {
-		s.ignoreVolumes = append(s.ignoreVolumes, v)
+		c.ignoreVolumes = append(c.ignoreVolumes, v)
 	}
-	// parse environment variables
-	if len(s.awsAccessKeyId) < 1 {
-		s.awsAccessKeyId = os.Getenv("AWS_ACCESS_KEY_ID")
-	}
-	if len(s.awsSecretAccessKey) < 1 {
-		s.awsSecretAccessKey = os.Getenv("AWS_SECRET_ACCESS_KEY")
-	}
-	if len(s.awsAccessKeyId) < 1 || len(s.awsSecretAccessKey) < 1 {
-		s.fatal("Must use -K and -S options or set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY environment variables.")
-	}
+	return &c
 }

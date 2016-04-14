@@ -9,7 +9,7 @@ Usage:
 Options:
   -s, --source=<region>     AWS region of running instance [default: us-east-1].
   -d, --dest=<region>       AWS region to store backup AMI [default: us-west-1].
-  -t, --timeout=<time>      Timeout waiting for AMI creation [default: 300]. Uses Go-style time specifier (ex: 10s, 1m, 2h)
+  -t, --timeout=<time>      Timeout waiting for AMI creation [default: 30m]. Uses Go-style time specifier (ex: 10s, 1m, 2h)
   -p, --purge=<window>      Comma-separated list of purge windows - see below for details.
   -n, --nagios              Run like a Nagios check.
   -o, --purgeonly           Purge old AMIs without creating new ones.

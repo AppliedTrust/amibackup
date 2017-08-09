@@ -145,7 +145,7 @@ func main() {
 					return
 				}
 				// find and tag snaphots
-				err := findTagVolumeSnapshots(instanceNameTag, awsec2, awsec2dest)
+				err = findTagVolumeSnapshots(instanceNameTag, awsec2, awsec2dest)
 				if err != nil {
 					log.Printf("Error Tagging Snapshots for %s: %s", instanceNameTag, err.Error())
 					return

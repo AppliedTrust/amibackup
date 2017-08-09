@@ -131,6 +131,7 @@ func main() {
 				defer func() {
 					done <- instanceNameTag
 				}()
+
 				// create local AMI
 				newAMI, err := createAMI(awsec2, instance, c, instanceNameTag)
 				if err != nil {
@@ -141,6 +142,12 @@ func main() {
 				// copy AMI to backup region
 				if err := copyAMI(awsec2dest, c, newAMI, instance, instanceNameTag); err != nil {
 					log.Printf("Error copying AMI for %s: %s", instanceNameTag, err.Error())
+					return
+				}
+				// find and tag snaphots
+				err := findTagVolumeSnapshots(instanceNameTag, awsec2, awsec2dest)
+				if err != nil {
+					log.Printf("Error Tagging Snapshots for %s: %s", instanceNameTag, err.Error())
 					return
 				}
 			}()
@@ -192,6 +199,76 @@ func findSnapshots(amiid string, awsec2 *ec2.EC2) (map[string]string, error) {
 		}
 	}
 	return snaps, nil
+}
+
+func findAMIs(instanceNameTag string, awsec2 *ec2.EC2, awsdestec2 *ec2.EC2) (map[string][]*ec2.Tag, error) {
+	amis := make(map[string][]*ec2.Tag)
+	resp, err := awsec2.DescribeImages(&ec2.DescribeImagesInput{Filters: []*ec2.Filter{{
+		Name:   aws.String("tag:hostname"),
+		Values: []*string{aws.String(instanceNameTag)},
+	}}})
+	if err != nil {
+		return nil, err
+	}
+	for _, image := range resp.Images {
+		for _, tag := range image.Tags {
+			amis[*image.ImageId] = append(amis[*image.ImageId], tag)
+		}
+	}
+	resp, err = awsdestec2.DescribeImages(&ec2.DescribeImagesInput{Filters: []*ec2.Filter{{
+		Name:   aws.String("tag:hostname"),
+		Values: []*string{aws.String(instanceNameTag)},
+	}}})
+	if err != nil {
+		return nil, err
+	}
+	for _, image := range resp.Images {
+		for _, tag := range image.Tags {
+			amis[*image.ImageId] = append(amis[*image.ImageId], tag)
+		}
+	}
+	return amis, nil
+}
+
+func TagVolumeSnapshots(instanceNameTag string, awsec2 *ec2.EC2, amis map[string][]*ec2.Tag) error {
+	resp, err := awsec2.DescribeSnapshots(&ec2.DescribeSnapshotsInput{})
+	if err != nil {
+		fmt.Println(err)
+		return err
+	}
+	for _, snapshot := range resp.Snapshots {
+		re, err := regexp.Compile(`ami-\w*`)
+		if err == nil {
+			res := re.FindStringSubmatch(*snapshot.Description)
+			if len(res) > 0 {
+				snapshot_ami := res[0]
+				if amis[snapshot_ami] != nil {
+					fmt.Println("Tagging " + *snapshot.SnapshotId)
+					_, err := awsec2.CreateTags(&ec2.CreateTagsInput{
+						Resources: []*string{aws.String(*snapshot.SnapshotId)},
+						Tags:      amis[snapshot_ami],
+					})
+					if err != nil {
+						fmt.Println(err)
+						return err
+					}
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// Finds and tags volume snapshots
+func findTagVolumeSnapshots(instanceNameTag string, awsec2 *ec2.EC2, awsdestec2 *ec2.EC2) error {
+	amis, err := findAMIs(instanceNameTag, awsec2, awsdestec2)
+	if err != nil {
+		return err
+	}
+	fmt.Println(amis)
+	err = TagVolumeSnapshots(instanceNameTag, awsec2, amis)
+	err = TagVolumeSnapshots(instanceNameTag, awsdestec2, amis)
+	return nil
 }
 
 // createAMI actually creates the AMI
@@ -286,6 +363,7 @@ func copyAMI(awsec2dest *ec2.EC2, c *Config, amiId string, instance *ec2.Instanc
 		}
 		log.Printf("Started copy of %s from %s (%s) to %s (%s).", instanceNameTag, c.sourceRegion, amiId, c.destRegion, *copyResp.ImageId)
 		time.Sleep(apiPollInterval)
+
 		_, err = awsec2dest.CreateTags(&ec2.CreateTagsInput{
 			Resources: []*string{copyResp.ImageId},
 			Tags: []*ec2.Tag{
@@ -296,12 +374,15 @@ func copyAMI(awsec2dest *ec2.EC2, c *Config, amiId string, instance *ec2.Instanc
 				{Key: aws.String("timestamp"), Value: aws.String(timeSecs)},
 			},
 		})
+
 		if err != nil {
 			return fmt.Errorf("Error tagging new AMI: %s", err.Error())
 		}
+
 		if err := waitForAMI(awsec2dest, *copyResp.ImageId, instanceNameTag, true); err != nil {
 			return err
 		}
+
 		log.Printf("Finished copy of %s from %s (%s) to %s (%s).", instanceNameTag, c.sourceRegion, amiId, c.destRegion, *copyResp.ImageId)
 	} else {
 		log.Printf("Not copying AMI %s - source and dest regions match", amiId)

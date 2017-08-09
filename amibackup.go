@@ -364,9 +364,6 @@ func copyAMI(awsec2dest *ec2.EC2, c *Config, amiId string, instance *ec2.Instanc
 		log.Printf("Started copy of %s from %s (%s) to %s (%s).", instanceNameTag, c.sourceRegion, amiId, c.destRegion, *copyResp.ImageId)
 		time.Sleep(apiPollInterval)
 
-		if err := waitForAMI(awsec2dest, *copyResp.ImageId, instanceNameTag, true); err != nil {
-			return err
-		}
 		_, err = awsec2dest.CreateTags(&ec2.CreateTagsInput{
 			Resources: []*string{copyResp.ImageId},
 			Tags: []*ec2.Tag{
@@ -381,6 +378,11 @@ func copyAMI(awsec2dest *ec2.EC2, c *Config, amiId string, instance *ec2.Instanc
 		if err != nil {
 			return fmt.Errorf("Error tagging new AMI: %s", err.Error())
 		}
+
+		if err := waitForAMI(awsec2dest, *copyResp.ImageId, instanceNameTag, true); err != nil {
+			return err
+		}
+
 		log.Printf("Finished copy of %s from %s (%s) to %s (%s).", instanceNameTag, c.sourceRegion, amiId, c.destRegion, *copyResp.ImageId)
 	} else {
 		log.Printf("Not copying AMI %s - source and dest regions match", amiId)

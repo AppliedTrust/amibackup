@@ -14,7 +14,7 @@ import (
 	"github.com/docopt/docopt-go"
 )
 
-const version = "0.13-20160411"
+const version = "0.14-20171229"
 
 var usage = `amibackup: create cross-region AWS AMI backups
 

@@ -2,18 +2,19 @@ package main
 
 import (
 	"fmt"
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/ec2"
-	"github.com/docopt/docopt-go"
 	"log"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go/service/ec2"
+	"github.com/docopt/docopt-go"
 )
 
-const version = "0.13-20160411"
+const version = "0.14-20171229"
 
 var usage = `amibackup: create cross-region AWS AMI backups
 
@@ -26,6 +27,8 @@ Options:
   -s, --source=<region>     AWS region of running instance [default: us-east-1].
   -d, --dest=<region>       AWS region to store backup AMI [default: us-west-1].
   -t, --timeout=<secs>      Timeout waiting for AMI creation [default: 30m].
+  -e, --encrypted           Encrypts the EBS volumes attached to the ami with key supplied by -k, or the accounts default KMS key. [default: false]
+  -k, --kms-key-id=<keyid>  KMS key arn for encrypted EBS volumes. Implies -e.
   -p, --purge=<window>      One or more purge windows - see below for details.
   -o, --purgeonly           Purge old AMIs without creating new ones.
   -D, --dry-run             Do not actually create or purge anything, just say what would have happened.
@@ -64,9 +67,11 @@ type Config struct {
 	sourceRegion       string
 	destRegion         string
 	timeoutString      string
+	kmsKeyId           string
 	timeout            time.Duration
 	windows            []window
 	purgeonly          bool
+	encrypted          bool
 	ignoreVolumes      []string
 	awsAccessKeyId     string
 	awsSecretAccessKey string
@@ -351,13 +356,21 @@ func copyAMI(awsec2dest *ec2.EC2, c *Config, amiId string, instance *ec2.Instanc
 	if c.destRegion != c.sourceRegion {
 		backupAmiName := fmt.Sprintf("%s-%s-%s", instanceNameTag, timeStamp, amiId)
 		backupDesc := fmt.Sprintf("%s %s %s", instanceNameTag, timeString, amiId)
-		copyResp, err := awsec2dest.CopyImage(&ec2.CopyImageInput{
+		params := &ec2.CopyImageInput{
 			SourceRegion:  aws.String(c.sourceRegion),
 			SourceImageId: aws.String(amiId),
 			Name:          aws.String(backupAmiName),
 			Description:   aws.String(backupDesc),
 			ClientToken:   aws.String(""),
-		})
+		}
+		if c.encrypted {
+			params.Encrypted = aws.Bool(true)
+			if c.kmsKeyId != "" {
+				params.KmsKeyId = aws.String(c.kmsKeyId)
+			} // else: uses default kms key
+		}
+
+		copyResp, err := awsec2dest.CopyImage(params)
 		if err != nil {
 			return fmt.Errorf("CopyImage failed: %s", err.Error())
 		}
@@ -519,6 +532,15 @@ func handleOptions() *Config {
 	}
 	if arguments["--dry-run"].(bool) {
 		c.dryRun = true
+	}
+	if arguments["--encrypted"].(bool) || arguments["--kms-key-id"] != nil { // TODO: can i cast that into a bool?
+		c.encrypted = true
+		if arguments["--kms-key-id"] != nil {
+			if !strings.Contains(arguments["--kms-key-id"].(string), c.destRegion) {
+				log.Fatalf("kms-key-id does not reside in destination.")
+			}
+			c.kmsKeyId = arguments["--kms-key-id"].(string)
+		}
 	}
 	for _, w := range arguments["--purge"].([]string) {
 		newWindow := window{}
